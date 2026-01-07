@@ -1,0 +1,218 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'Which app to rollback'
+        required: true
+        type: choice
+        options:
+          - home
+          - account
+          - products
+          - checkout
+      environment:
+        description: 'Which environment to rollback'
+        required: true
+        type: choice
+        options:
+          - smoke
+          - qa
+          - production
+      target_sha:
+        description: 'Git SHA to rollback to (leave empty to use previous deployment)'
+        required: false
+        type: string
+      confirm:
+        description: 'Type "rollback" to confirm'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+  packages: read
+
+concurrency:
+  group: rollback-${{ inputs.app }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate rollback request
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.determine-image.outputs.image_tag }}
+      service_name: ${{ steps.determine-service.outputs.service_name }}
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "rollback" ]; then
+            echo "::error::Confirmation failed. You must type 'rollback' to proceed."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine target image
+        id: determine-image
+        run: |
+          APP="${{ inputs.app }}"
+          TARGET_SHA="${{ inputs.target_sha }}"
+
+          # If no SHA provided, find the previous one
+          if [ -z "$TARGET_SHA" ]; then
+            echo "No SHA provided. Finding previous deployment..."
+
+            # Get the last 10 commits that touched this app
+            COMMITS=$(git log -10 --pretty=format:"%H" -- "apps/mf-$APP/**" "packages/**")
+
+            # Find the second commit (first is current, second is previous)
+            TARGET_SHA=$(echo "$COMMITS" | sed -n '2p')
+
+            if [ -z "$TARGET_SHA" ]; then
+              echo "::error::No previous deployment found for this app"
+              echo "::error::This app may have only been deployed once"
+              echo "::error::Please specify a target SHA manually, or check deployment history"
+              exit 1
+            fi
+
+            echo "Found previous SHA: $TARGET_SHA"
+          else
+            # Validate provided SHA exists
+            if ! git rev-parse --verify "$TARGET_SHA" >/dev/null 2>&1; then
+              echo "::error::Invalid SHA: $TARGET_SHA"
+              echo "::error::SHA does not exist in git history"
+              exit 1
+            fi
+            echo "Using provided SHA: $TARGET_SHA"
+          fi
+
+          # Validate SHA is from main branch
+          if ! git merge-base --is-ancestor "$TARGET_SHA" origin/main 2>/dev/null; then
+            echo "::error::SHA $TARGET_SHA is not in main branch history"
+            echo "::error::Can only rollback to versions that were deployed via main branch"
+            echo "::error::Check deployment history or git log on main branch"
+            exit 1
+          fi
+          echo "✓ SHA is from main branch"
+
+          # Warn about old rollback targets
+          COMMIT_DATE=$(git show -s --format=%ci "$TARGET_SHA")
+          COMMIT_TIMESTAMP=$(git show -s --format=%ct "$TARGET_SHA")
+          CURRENT_TIMESTAMP=$(date +%s)
+          DAYS_OLD=$(( ($CURRENT_TIMESTAMP - $COMMIT_TIMESTAMP) / 86400 ))
+
+          if [ "$DAYS_OLD" -gt 30 ]; then
+            echo "::warning::⚠️  Rolling back to version from $DAYS_OLD days ago (committed: $COMMIT_DATE)"
+            echo "::warning::High risk of incompatibilities with current database schema or infrastructure"
+            echo "::warning::Strongly recommend testing in smoke environment first"
+          fi
+
+          # Warn about package dependencies
+          echo ""
+          echo "::warning::📦 Package Dependency Notice:"
+          echo "::warning::Rollback only affects the $APP microfrontend"
+          echo "::warning::Shared packages (sf-lib-*) remain at their current versions"
+          echo "::warning::Verify compatibility if rolling back across major version changes"
+
+          # Map app name to service name
+          case "$APP" in
+            home) SERVICE="sf-home" ;;
+            account) SERVICE="sf-account" ;;
+            products) SERVICE="sf-products" ;;
+            checkout) SERVICE="sf-checkout" ;;
+            *) echo "::error::Invalid app: $APP"; exit 1 ;;
+          esac
+
+          IMAGE_TAG="ghcr.io/${{ github.repository }}/$SERVICE:$TARGET_SHA"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Rolling back to: $IMAGE_TAG"
+
+      - name: Determine service name
+        id: determine-service
+        run: |
+          APP="${{ inputs.app }}"
+          ENV="${{ inputs.environment }}"
+
+          # Map app name to service name
+          case "$APP" in
+            home) SERVICE="sf-home" ;;
+            account) SERVICE="sf-account" ;;
+            products) SERVICE="sf-products" ;;
+            checkout) SERVICE="sf-checkout" ;;
+            *) echo "::error::Invalid app: $APP"; exit 1 ;;
+          esac
+
+          # Add environment suffix
+          case "$ENV" in
+            smoke) SERVICE_NAME="$SERVICE-smoke" ;;
+            qa) SERVICE_NAME="$SERVICE-qa" ;;
+            production) SERVICE_NAME="$SERVICE-prod" ;;
+            *) echo "::error::Invalid environment: $ENV"; exit 1 ;;
+          esac
+
+          echo "service_name=$SERVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "Rolling back service: $SERVICE_NAME"
+
+      - name: Verify image exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE_TAG="${{ steps.determine-image.outputs.image_tag }}"
+
+          # Extract owner, repo, and tag from image
+          REPO_PATH=$(echo "$IMAGE_TAG" | sed 's|ghcr.io/||' | cut -d':' -f1)
+          TAG=$(echo "$IMAGE_TAG" | cut -d':' -f2)
+
+          echo "Checking if image exists: $IMAGE_TAG"
+
+          # Check if package version exists using GitHub API
+          PACKAGE_NAME=$(echo "$REPO_PATH" | cut -d'/' -f3)
+          ORG=$(echo "$REPO_PATH" | cut -d'/' -f1)
+
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/orgs/$ORG/packages/container/$PACKAGE_NAME/versions")
+
+          if echo "$RESPONSE" | grep -q "\"name\":\"$TAG\""; then
+            echo "✓ Image found: $IMAGE_TAG"
+          else
+            echo "::warning::Could not verify image exists. Proceeding anyway..."
+            echo "If rollback fails, the image may not exist in the registry."
+          fi
+
+  rollback:
+    name: Rollback ${{ inputs.app }} in ${{ inputs.environment }}
+    needs: validate
+    uses: ./.github/workflows/_deploy-render.yaml
+    with:
+      app: ${{ needs.validate.outputs.service_name }}
+      image: ${{ needs.validate.outputs.image_tag }}
+    secrets:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+
+  notify:
+    name: Notify rollback result
+    needs: [validate, rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rollback successful
+        if: needs.rollback.result == 'success'
+        run: |
+          echo "::notice::✓ Rollback completed successfully"
+          echo "Service: ${{ needs.validate.outputs.service_name }}"
+          echo "Image: ${{ needs.validate.outputs.image_tag }}"
+
+      - name: Rollback failed
+        if: needs.rollback.result == 'failure'
+        run: |
+          echo "::error::✗ Rollback failed"
+          echo "Service: ${{ needs.validate.outputs.service_name }}"
+          echo "Image: ${{ needs.validate.outputs.image_tag }}"
+          echo "Check the logs above for details"
+          exit 1
